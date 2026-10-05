@@ -1,4 +1,4 @@
-name: RDP
+name: RDP - ngrok
 
 on:
   workflow_dispatch:
@@ -9,89 +9,281 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      - name: Optimize Performance (Disable Defender)
+      # ==========================================
+      # 1. CONFIGURE WINDOWS RDP
+      # ==========================================
+      - name: Configure RDP
+        shell: powershell
         run: |
-          Set-MpPreference -DisableRealtimeMonitoring $true -ErrorAction SilentlyContinue
+          Write-Host "Enabling Remote Desktop..."
 
-      - name: Configure Core RDP Settings
-        run: |
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name "fDenyTSConnections" `
+            -Value 0 `
+            -Force
 
-          netsh advfirewall firewall delete rule name="RDP-Tailscale"
-          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
+          # Keep Network Level Authentication enabled
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name "UserAuthentication" `
+            -Value 1 `
+            -Force
+
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue
+
           Restart-Service -Name TermService -Force
 
-      - name: Create RDP User with Secure Password
+          Write-Host "RDP enabled."
+
+      # ==========================================
+      # 2. CREATE RDP USER
+      # ==========================================
+      - name: Create RDP User
+        shell: powershell
         run: |
           Add-Type -AssemblyName System.Security
+
           $charSet = @{
               Upper   = [char[]](65..90)
               Lower   = [char[]](97..122)
               Number  = [char[]](48..57)
-              Special = ([char[]](33..47) + [char[]](58..64) + [char[]](91..96) + [char[]](123..126))
+              Special = [char[]]"!@#$%*-_"
           }
+
           $rawPassword = @()
+
           $rawPassword += $charSet.Upper | Get-Random -Count 4
           $rawPassword += $charSet.Lower | Get-Random -Count 4
           $rawPassword += $charSet.Number | Get-Random -Count 4
           $rawPassword += $charSet.Special | Get-Random -Count 4
+
           $password = -join ($rawPassword | Sort-Object { Get-Random })
-          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
-          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
-          
-          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
 
-      - name: Install Tailscale
-        run: |
-          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
-          $installerPath = "$env:TEMP\tailscale.msi"
-          
-          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
-          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
-          Remove-Item $installerPath -Force
+          $securePass = ConvertTo-SecureString `
+            $password `
+            -AsPlainText `
+            -Force
 
-      - name: Establish Tailscale Connection
-        run: |
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
-          
-          $tsIP = $null
-          $retries = 0
-          while (-not $tsIP -and $retries -lt 10) {
-              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
-              Start-Sleep -Seconds 5
-              $retries++
+          if (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue) {
+              Set-LocalUser -Name "RDP" -Password $securePass
           }
-          
-          if (-not $tsIP) {
-              Write-Error "Tailscale IP not assigned. Exiting."
+          else {
+              New-LocalUser `
+                -Name "RDP" `
+                -Password $securePass `
+                -AccountNeverExpires
+          }
+
+          Add-LocalGroupMember `
+            -Group "Remote Desktop Users" `
+            -Member "RDP" `
+            -ErrorAction SilentlyContinue
+
+          Add-LocalGroupMember `
+            -Group "Administrators" `
+            -Member "RDP" `
+            -ErrorAction SilentlyContinue
+
+          "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+
+          Write-Host "RDP user created."
+
+      # ==========================================
+      # 3. TEST LOCAL RDP
+      # ==========================================
+      - name: Test Local RDP
+        shell: powershell
+        run: |
+          Write-Host "Testing localhost:3389..."
+
+          $test = Test-NetConnection `
+            -ComputerName 127.0.0.1 `
+            -Port 3389
+
+          if (-not $test.TcpTestSucceeded) {
+              Write-Error "RDP port 3389 is not responding."
               exit 1
           }
-          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
 
-      - name: Verify RDP Accessibility
+          Write-Host "RDP localhost:3389 OK."
+
+      # ==========================================
+      # 4. DOWNLOAD NGROK
+      # ==========================================
+      - name: Download ngrok
+        shell: powershell
         run: |
-          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
-          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
-          if (-not $testResult.TcpTestSucceeded) {
-              Write-Error "TCP connection to RDP port 3389 failed"
+          $url = "https://bin.ngrok.com/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip"
+
+          $zip = "$env:TEMP\ngrok.zip"
+          $dir = "$env:TEMP\ngrok"
+
+          Write-Host "Downloading ngrok..."
+
+          Invoke-WebRequest `
+            -Uri $url `
+            -OutFile $zip
+
+          if (Test-Path $dir) {
+              Remove-Item $dir -Recurse -Force
+          }
+
+          Expand-Archive `
+            -Path $zip `
+            -DestinationPath $dir `
+            -Force
+
+          $ngrok = "$dir\ngrok.exe"
+
+          if (-not (Test-Path $ngrok)) {
+              Write-Error "ngrok.exe not found."
               exit 1
           }
-          Write-Host "TCP connectivity successful!"
 
-      - name: Maintain Connection
+          "NGROK_EXE=$ngrok" >> $env:GITHUB_ENV
+
+          & $ngrok version
+
+      # ==========================================
+      # 5. AUTHENTICATE NGROK
+      # ==========================================
+      - name: Authenticate ngrok
+        shell: powershell
+        env:
+          NGROK_AUTHTOKEN: ${{ secrets.NGROK_AUTHTOKEN }}
         run: |
-          Write-Host "`n=== RDP ACCESS ==="
-          Write-Host "Address: $env:TAILSCALE_IP"
+          if ([string]::IsNullOrWhiteSpace($env:NGROK_AUTHTOKEN)) {
+              Write-Error "GitHub Secret NGROK_AUTHTOKEN is missing."
+              exit 1
+          }
+
+          & "$env:NGROK_EXE" `
+            config `
+            add-authtoken `
+            "$env:NGROK_AUTHTOKEN"
+
+          if ($LASTEXITCODE -ne 0) {
+              Write-Error "ngrok authentication failed."
+              exit 1
+          }
+
+          Write-Host "ngrok authenticated."
+
+      # ==========================================
+      # 6. START NGROK TCP -> RDP 3389
+      # ==========================================
+      - name: Start ngrok TCP Tunnel
+        shell: powershell
+        run: |
+          Write-Host "Starting ngrok TCP tunnel..."
+
+          $process = Start-Process `
+            -FilePath "$env:NGROK_EXE" `
+            -ArgumentList "tcp 3389 --log stdout" `
+            -WindowStyle Hidden `
+            -PassThru
+
+          "NGROK_PID=$($process.Id)" >> $env:GITHUB_ENV
+
+          Start-Sleep -Seconds 8
+
+          if ($process.HasExited) {
+              Write-Error "ngrok exited unexpectedly."
+              exit 1
+          }
+
+          Write-Host "ngrok started. PID: $($process.Id)"
+
+      # ==========================================
+      # 7. GET PUBLIC NGROK ADDRESS
+      # ==========================================
+      - name: Get RDP Address
+        shell: powershell
+        run: |
+          $tunnel = $null
+
+          for ($i = 0; $i -lt 20; $i++) {
+
+              try {
+                  $response = Invoke-RestMethod `
+                    -Uri "http://127.0.0.1:4040/api/tunnels"
+
+                  $tunnel = $response.tunnels |
+                    Where-Object {
+                        $_.proto -eq "tcp"
+                    } |
+                    Select-Object -First 1
+
+                  if ($tunnel) {
+                      break
+                  }
+              }
+              catch {
+                  Write-Host "Waiting for ngrok..."
+              }
+
+              Start-Sleep -Seconds 3
+          }
+
+          if (-not $tunnel) {
+              Write-Error "Unable to obtain ngrok TCP address."
+              exit 1
+          }
+
+          $publicUrl = $tunnel.public_url
+
+          # tcp://x.tcp.ngrok.io:12345
+          # becomes:
+          # x.tcp.ngrok.io:12345
+
+          $rdpAddress = $publicUrl -replace "^tcp://",""
+
+          "RDP_ADDRESS=$rdpAddress" >> $env:GITHUB_ENV
+
+          Write-Host ""
+          Write-Host "=========================================="
+          Write-Host " NGROK TCP READY"
+          Write-Host "=========================================="
+          Write-Host " Address : $rdpAddress"
+          Write-Host " Username: RDP"
+          Write-Host "=========================================="
+          Write-Host ""
+
+      # ==========================================
+      # 8. SHOW LOGIN INFORMATION + KEEP ALIVE
+      # ==========================================
+      - name: Maintain RDP Connection
+        shell: powershell
+        run: |
+          Write-Host ""
+          Write-Host "=========================================="
+          Write-Host "             RDP ACCESS"
+          Write-Host "=========================================="
+          Write-Host ""
+          Write-Host "Address : $env:RDP_ADDRESS"
           Write-Host "Username: RDP"
-          Write-Host "$env:RDP_CREDS"
-          Write-Host "==================`n"
-          
+          Write-Host "Password: $env:RDP_PASSWORD"
+          Write-Host ""
+          Write-Host "=========================================="
+          Write-Host ""
+          Write-Host "Open Microsoft Remote Desktop"
+          Write-Host "and enter the Address shown above."
+          Write-Host ""
+
           while ($true) {
-              Write-Host "[$(Get-Date)] RDP Active"
+
+              # Verify ngrok is still alive
+              $ngrokProcess = Get-Process `
+                -Id $env:NGROK_PID `
+                -ErrorAction SilentlyContinue
+
+              if (-not $ngrokProcess) {
+                  Write-Error "ngrok process stopped."
+                  exit 1
+              }
+
+              Write-Host "[$(Get-Date)] RDP + ngrok Active"
+
               Start-Sleep -Seconds 300
           }
-          
